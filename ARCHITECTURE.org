@@ -1,0 +1,567 @@
+* CLBSD Architecture
+This document is for AI agents, but could also be helpful to humans looking to see how it works.
+
+** Design Philosophy
+
+CLBSD is a thin, opinionated control plane. It does not replace FreeBSD primitives; it composes them through a Lisp image that the operator can inspect and mutate at runtime. The guiding principles are:
+
+- *Declarative desired state* — the operator declares what should exist; a reconciliation loop makes it so.
+- *Lisp as the runtime* — the running SBCL image is the source of truth. Every subsystem is reachable via SLIME.
+- *ZFS as the data layer* — all container storage is a ZFS dataset, giving snapshots, cloning, and send/receive for free.
+- *Networking is the operator's concern* — CLBSD does not provision VPNs or overlay networks. It writes Nginx config fragments and lets the host network do the rest.
+
+** Layer 1: Container Abstraction
+
+Layer 1 is the foundation of CLBSD. It provides a single unified Lisp representation for both FreeBSD Jails and Linux Docker containers, backed by per-container ZFS datasets, and fronted by a dynamically generated Nginx ingress.
+
+*** 1.1 The Container Struct (CL Data Model)
+
+Every managed workload is represented by a ~container~ struct. All lifecycle operations and the reconciler operate exclusively on these structs.
+
+#+BEGIN_SRC lisp
+(defstruct container
+  ;; Identity
+  name          ; string — unique within the host
+  type          ; keyword — :jail | :docker
+
+  ;; Storage
+  dataset       ; string — ZFS dataset path, e.g. "tank/clbsd/myapp"
+
+  ;; Docker-specific
+  image         ; string | nil — Docker image, e.g. "redis:7-alpine"
+
+  ;; Ingress
+  domain        ; string | nil — hostname the routing jail will proxy to
+  port          ; integer | nil — port the workload listens on inside the container
+
+  ;; Runtime
+  state         ; keyword — :stopped | :running | :error
+  dirty-p       ; boolean — set to T by (setf ...) accessors; cleared by reconciler
+
+  ;; Extensibility (see Layer 2 §2.3)
+  callbacks)    ; a-list of keyword -> function for kqueue and lifecycle hooks
+#+END_SRC
+
+All writes to a container's slots must go through the generated ~(setf container-<slot>)~ accessors, which additionally set ~dirty-p~ to ~T~ and signal the reconciler's condition variable. Direct slot access is internal to the reconciler only.
+
+*Key decision:* ~defstruct~ is preferred over CLOS for the base type because it gives free ~copy-container~ (used by the reconciler for diffing) and slot accessors without boilerplate. CLOS generic functions dispatch on the ~:type~ slot for backend-specific behaviour.
+
+*** 1.2 Jail Backend
+
+The jail backend is a thin wrapper over FreeBSD's ~jail(8)~ utility and ~rc.conf~ jail directives. CLBSD does not use a third-party jail manager (no ~bastille~, no ~cbsd~); it writes configuration directly.
+
+**** Lifecycle
+
+| Lisp function      | Host action                                               |
+|--------------------+-----------------------------------------------------------|
+| ~(create-jail c)~  | Clone ZFS template snapshot → write ~/etc/jail.conf~ fragment → ~jail -c~ |
+| ~(start-jail c)~   | ~service jail start <name>~                               |
+| ~(stop-jail c)~    | ~service jail stop <name>~                                |
+| ~(destroy-jail c)~ | ~jail -r~ → remove ~/etc/jail.conf~ fragment → ~zfs destroy~ dataset |
+
+All shell interactions go through ~uiop:run-program~ with ~:output :string :error-output :string~. Errors surface as Lisp conditions that the reconciler catches (see §1.7) and that Layer 2 kqueue handlers can react to (see §2.3).
+
+**** ZFS rootfs
+
+Each jail's root filesystem is a ZFS dataset cloned from a maintained base template:
+
+#+BEGIN_EXAMPLE
+tank/clbsd/templates/freebsd-14  (base snapshot)
+    └── tank/clbsd/<name>         (per-jail clone)
+        └── tank/clbsd/<name>/data  (persistent data, survives jail rebuild)
+#+END_EXAMPLE
+
+Cloning is instant and copy-on-write. Rolling back a jail to a known-good state is ~zfs rollback~.
+
+**** Networking
+
+CLBSD writes a minimal ~/etc/jail.conf~ fragment per jail:
+
+#+BEGIN_EXAMPLE
+<name> {
+  path = "/tank/clbsd/<name>";
+  ip4.addr = <host-bridge-ip>;   # or vnet = new; for VNET jails
+  exec.start = "/bin/sh /etc/rc";
+  exec.stop  = "/bin/sh /etc/rc.shutdown";
+  persist;
+}
+#+END_EXAMPLE
+
+IP assignment and bridge configuration are the operator's responsibility. CLBSD reads the ~ip4.addr~ from the struct and writes it verbatim.
+
+*** 1.3 Docker / Alpine Bhyve VM Backend
+
+Docker requires a real Linux kernel — FreeBSD jails share the host kernel and the Linuxulator does not implement Linux namespaces or cgroups. CLBSD therefore runs a minimal Alpine Linux guest under Bhyve (FreeBSD's native hypervisor) as the Docker host.
+
+#+BEGIN_EXAMPLE
+Host FreeBSD (SBCL control plane)
+  ├── Jails (FreeBSD workloads)        ← jail(8), jexec, VNET
+  └── Alpine Bhyve VM                  ← real Linux kernel, Docker daemon
+       ├── docker: myapp               ← docker run ...
+       └── docker: redis               ← docker run ...
+            └── volumes from ZFS datasets passed through via virtio-9p / NFS
+#+END_EXAMPLE
+
+The Bhyve VM is infrastructure, like the routing jail — it is managed by CLBSD but is not a user-facing container in ~clbsd-state~. Its lifecycle is tied to the CLBSD image itself: started on boot, stopped on shutdown.
+
+**** Communication channel
+
+The control plane talks to the Docker daemon inside the Bhyve VM over a TCP-exposed Docker socket:
+
+#+BEGIN_SRC lisp
+(defvar *docker-host* "tcp://10.0.0.2:2375"
+  "Address of the Docker daemon inside the Alpine Bhyve VM.
+   Set during CLBSD init from the operator's config.")
+#+END_SRC
+
+All Docker commands are issued by shelling out with ~DOCKER_HOST~ set:
+
+#+BEGIN_SRC lisp
+(defun docker-cmd (args)
+  "Run a docker CLI command against the Bhyve VM's daemon."
+  (uiop:run-program
+    (cons "docker" args)
+    :environment (list (format nil "DOCKER_HOST=~A" *docker-host*))
+    :output :string :error-output :string))
+#+END_SRC
+
+An alternative is SSH into the VM (~ssh alpine-docker docker ...~). TCP socket is preferred because it avoids SSH key management and is easier to health-check.
+
+**** Lifecycle
+
+| Lisp function        | Action                                                          |
+|----------------------+-----------------------------------------------------------------|
+| ~(create-docker c)~  | ~docker pull <image>~ via ~docker-cmd~                          |
+| ~(start-docker c)~   | ~docker run -d --name <name> -v <vol>:/data -p <port>:<port>~ |
+| ~(stop-docker c)~    | ~docker stop <name>~ via ~docker-cmd~                           |
+| ~(destroy-docker c)~ | ~docker rm <name>~ + ~zfs destroy~ child dataset               |
+
+**** Volume passthrough
+
+Docker container data lives on ZFS datasets on the FreeBSD host. These are shared into the Bhyve VM via virtio-9p (or NFS export for simplicity) and then bind-mounted as Docker volumes:
+
+#+BEGIN_EXAMPLE
+FreeBSD host:  tank/clbsd/<name>/data
+                     │
+                     │  virtio-9p share (or NFS)
+                     ▼
+Alpine VM:     /clbsd-volumes/<name>
+                     │
+                     │  docker run -v /clbsd-volumes/<name>:/data
+                     ▼
+Docker container:  /data
+#+END_EXAMPLE
+
+This keeps ZFS snapshots and send/receive working from the host side, even for Docker workloads.
+
+**** Bhyve VM management
+
+#+BEGIN_SRC lisp
+(defun boot-docker-vm ()
+  "Start the Alpine Bhyve VM. Called once during CLBSD init."
+  (uiop:run-program
+    '("bhyvectl" "--create" "--vm=alpine-docker") :output :string)
+  (uiop:run-program
+    (list "bhyve" "-c" "2" "-m" "1G"
+          "-s" "0,hostbridge"
+          "-s" "1,lpc"
+          "-s" "2,virtio-net,tap0"
+          "-s" "3,virtio-blk,/tank/clbsd/vm/alpine.img"
+          "-s" "4,virtio-9p,clbsd-volumes=/tank/clbsd"
+          "-l" "com1,stdio"
+          "alpine-docker")))
+
+(defun shutdown-docker-vm ()
+  (docker-cmd '("run" "--rm" "--privileged" "alpine" "poweroff"))
+  (uiop:run-program '("bhyvectl" "--destroy" "--vm=alpine-docker")))
+#+END_SRC
+
+*** 1.4 Unified Container API
+
+Both backends are exposed through a single set of generic functions that dispatch on ~(container-type c)~.
+
+#+BEGIN_SRC lisp
+;; Lifecycle
+(defgeneric create  (container))
+(defgeneric start   (container))
+(defgeneric stop    (container))
+(defgeneric restart (container))
+(defgeneric destroy (container))
+
+;; Introspection
+(defgeneric running-p (container))  ; returns T/NIL
+(defgeneric status    (container))  ; returns current observed state keyword
+
+;; REPL access (jail-only — Docker containers don't run Lisp images)
+(defgeneric connect-repl (container))
+#+END_SRC
+
+Jail methods shell out via ~uiop:run-program~ directly on the host. Docker methods go through ~docker-cmd~ (see §1.3), which targets the Bhyve VM's Docker daemon. The caller never needs to know which backend is active.
+
+Layer 2 builds its user-facing management interface on top of these generic functions.
+
+*** 1.5 ZFS Dataset Per Container
+
+CLBSD manages datasets under a single configured root pool, e.g. ~tank/clbsd~. The pool itself must exist before CLBSD starts.
+
+**** Dataset layout
+
+#+BEGIN_EXAMPLE
+<zpool>/clbsd/
+  templates/
+    freebsd-14@base            ← snapshot used for jail clones
+  <container-name>/            ← rootfs (jail) or scratch (docker)
+  <container-name>/data/       ← persistent data (survives destroy+recreate)
+  routing/                     ← rootfs of the dedicated Nginx routing jail
+  vm/
+    alpine.img                 ← Bhyve VM disk image for Docker backend
+#+END_EXAMPLE
+
+**** Operations
+
+| Lisp function                       | ZFS command                              |
+|-------------------------------------+------------------------------------------|
+| ~(create-dataset c)~                | ~zfs clone <template>@base <dataset>~    |
+| ~(snapshot c label)~                | ~zfs snapshot <dataset>@<label>~         |
+| ~(rollback c label)~                | ~zfs rollback <dataset>@<label>~         |
+| ~(export-container c dest-host)~    | ~zfs send ... \| ssh dest zfs receive~   |
+
+Snapshot names are generated as ~<name>-<unix-timestamp>~ by default; the operator can supply an explicit label.
+
+*** 1.6 Dynamic Ingress (nginx.conf Generation)
+
+A dedicated routing jail contains Nginx. CLBSD owns its configuration file; the operator must not edit ~nginx.conf~ by hand.
+
+**** Config generation
+
+#+BEGIN_SRC lisp
+(defun generate-nginx-conf (containers)
+  "Pure function. Returns an nginx.conf string for all containers with a domain."
+  (let ((routable (remove-if-not #'container-domain containers)))
+    (format nil "~{~A~%~}"
+            (mapcar #'container->server-block routable))))
+
+(defun container->server-block (c)
+  (format nil
+    "server {~%  server_name ~A;~%  location / { proxy_pass http://~A:~A; }~%}~%"
+    (container-domain c)
+    (container-ip c)
+    (container-port c)))
+#+END_SRC
+
+~container-ip~ resolves differently per backend: for jails it reads the ~ip4.addr~ from ~/etc/jail.conf~; for Docker containers it queries ~docker inspect~ via ~docker-cmd~ to get the container's IP within the Bhyve VM's bridge network (which is reachable from the host via the VM's tap interface).
+
+The output is a complete ~nginx.conf~ (wrapped in an ~http {}~ block by a top-level template). CLBSD writes it to ~<routing-dataset>/usr/local/etc/nginx/nginx.conf~, then runs:
+
+#+BEGIN_SRC lisp
+(defun reload-nginx (routing-jail)
+  (uiop:run-program
+    (list "jexec" (container-name routing-jail) "service" "nginx" "reload")))
+#+END_SRC
+
+**** TLS
+
+TLS is out of scope for v0. The operator places certificates in the routing jail's dataset and extends the Nginx template. A future layer may automate ACME via a hook.
+
+*** 1.7 Reconciliation Loop
+
+The reconciler is a background thread that continuously converges actual system state toward ~clbsd-state~. It is the sole component that reads ~dirty-p~ and performs side effects against jails, Docker, and ZFS.
+
+**** Data flow
+
+#+BEGIN_EXAMPLE
+(setf clbsd-state ...)          ← user code or Layer 2 init loader
+       │
+       ▼
+condition variable signal
+       │
+       ▼
+reconciler wakes
+       │
+       ├─ diff desired vs. observed
+       │     ├─ new containers   → create + start
+       │     ├─ removed          → stop + destroy
+       │     └─ changed (dirty)  → stop → reconfigure → start
+       │
+       ├─ fire lifecycle callbacks (see §2.3)
+       │
+       └─ regenerate nginx.conf → reload Nginx
+#+END_EXAMPLE
+
+**** Implementation sketch
+
+#+BEGIN_SRC lisp
+(defvar *reconciler-lock*      (bt:make-lock))
+(defvar *reconciler-condvar*   (bt:make-condition-variable))
+
+(defun signal-reconciler ()
+  (bt:with-lock-held (*reconciler-lock*)
+    (bt:condition-notify *reconciler-condvar*)))
+
+(defun reconciler-loop ()
+  "Main loop for the reconciler thread. Sleeps until signalled."
+  (loop
+    (bt:with-lock-held (*reconciler-lock*)
+      (bt:condition-wait *reconciler-condvar* *reconciler-lock*))
+    (handler-case
+        (reconcile-once *clbsd-state*)
+      (error (e)
+        (log-event :reconciler-error :detail (princ-to-string e))
+        (warn "Reconciler error: ~A" e)))))
+
+(defun reconcile-once (desired)
+  (let ((observed (observe-running-containers)))
+    (apply-diff desired observed)
+    (reload-nginx *routing-jail*)))
+#+END_SRC
+
+~observe-running-containers~ builds the observed set from two sources:
+- ~jls --libxo json~ for running jails (parsed on-host).
+- ~docker-cmd '("ps" "--format" "json")~ for Docker containers inside the Bhyve VM.
+
+The diff is a set difference on ~:name~. Dirty containers are always re-applied regardless of observed state.
+
+**** Interaction with Layer 2
+
+The reconciler is a Layer 1 primitive. Layer 2 provides the mechanisms that *trigger* it:
+- Direct state mutation via the SLIME REPL or init file → sets ~dirty-p~ → signals reconciler.
+- kqueue event handlers (§2.3) detect host-side events (e.g. jail exit) → call ~(signal-reconciler)~.
+- The Layer 2 event log (§2.4) records every reconciler action for observability.
+
+** Layer 2: Common Lisp Control Plane
+
+Layer 2 is the runtime that the operator interacts with. It turns Layer 1's container primitives into a managed, observable, event-driven system. The control plane is a single long-running SBCL image.
+
+*** 2.1 SBCL Image Lifecycle
+
+#+BEGIN_EXAMPLE
+sbcl --load clbsd-system.lisp
+       │
+       ├─ load ASDF system "clbsd"
+       ├─ boot-docker-vm           (Layer 1 — start Bhyve)
+       ├─ start routing jail       (Layer 1 — Nginx)
+       ├─ load clbsd-init.lisp     (§2.2 — declarative config)
+       ├─ start reconciler thread  (Layer 1 §1.7)
+       ├─ start kqueue thread      (§2.3)
+       ├─ start swank server       (§2.5)
+       │
+       └─ image is live — REPL, Emacs, and kqueue all active
+#+END_EXAMPLE
+
+Shutdown reverses this: stop swank, drain kqueue, stop reconciler, stop all containers, shut down Bhyve VM.
+
+*** 2.2 Declarative Init File
+
+The operator writes a ~clbsd-init.lisp~ file that declares desired state. It is ordinary Common Lisp; no DSL.
+
+#+BEGIN_SRC lisp
+;; clbsd-init.lisp — loaded at boot, re-loadable at runtime via REPL
+(setf *clbsd-state*
+  (list
+    (make-container :name "gitea"
+                    :type :jail
+                    :dataset "tank/clbsd/gitea"
+                    :domain "git.home"
+                    :port 3000
+                    :callbacks '((:on-crash . auto-restart-handler)))
+
+    (make-container :name "jellyfin"
+                    :type :docker
+                    :image "jellyfin/jellyfin:latest"
+                    :dataset "tank/clbsd/jellyfin"
+                    :domain "media.home"
+                    :port 8096)
+
+    (make-container :name "postgres"
+                    :type :jail
+                    :dataset "tank/clbsd/postgres"
+                    :port 5432
+                    :callbacks '((:on-crash   . auto-restart-handler)
+                                 (:post-start . run-pg-healthcheck)))))
+#+END_SRC
+
+Re-evaluating this form from SLIME updates the desired state; the reconciler picks up the diff.
+
+*** 2.3 kqueue Event System
+
+FreeBSD's ~kqueue(2)~ is a scalable event notification mechanism. Layer 2 runs a dedicated kqueue thread that watches for host-level events relevant to managed containers.
+
+**** Watched events
+
+| kqueue filter        | What it watches                        | Handler behaviour                       |
+|----------------------+----------------------------------------+-----------------------------------------|
+| ~EVFILT_PROC~        | Jail init process exits                | Mark container ~:error~, signal reconciler |
+| ~EVFILT_VNODE~       | Changes to config files on ZFS datasets | Re-read config, signal reconciler        |
+| ~EVFILT_TIMER~       | Periodic health-check intervals        | Run registered health-check callback     |
+
+**** Architecture
+
+#+BEGIN_EXAMPLE
+  kqueue fd
+    │
+    │  kevent() blocks in dedicated thread
+    ▼
+  event dispatch
+    │
+    ├─ match event to container (by PID / path → name)
+    │
+    ├─ look up :callbacks a-list on the container struct
+    │     ├─ :on-crash   → called when EVFILT_PROC fires NOTE_EXIT
+    │     ├─ :on-change  → called when EVFILT_VNODE fires NOTE_WRITE
+    │     └─ :on-health  → called periodically via EVFILT_TIMER
+    │
+    ├─ execute callback in a fresh thread (never block the kqueue thread)
+    │
+    └─ callback may call (signal-reconciler) to trigger Layer 1 convergence
+#+END_EXAMPLE
+
+**** Implementation sketch
+
+#+BEGIN_SRC lisp
+(defvar *kqueue-fd* nil "File descriptor for the kqueue instance.")
+
+(defun init-kqueue ()
+  (setf *kqueue-fd* (kqueue:kqueue)))
+
+(defun watch-jail-process (container pid)
+  "Register EVFILT_PROC on a jail's init PID."
+  (kqueue:kevent *kqueue-fd*
+    :filter :proc
+    :flags  '(:add :enable :oneshot)
+    :fflags '(:exit)
+    :ident  pid
+    :udata  (container-name container)))
+
+(defun watch-dataset-changes (container)
+  "Register EVFILT_VNODE on the container's data directory."
+  (let ((fd (posix:open (container-dataset container) :rdonly)))
+    (kqueue:kevent *kqueue-fd*
+      :filter :vnode
+      :flags  '(:add :enable :clear)
+      :fflags '(:write :rename :delete)
+      :ident  fd
+      :udata  (container-name container))))
+
+(defun kqueue-loop ()
+  "Main loop for the kqueue thread. Blocks on kevent."
+  (loop
+    (let ((events (kqueue:kevent *kqueue-fd* :nevents 32)))
+      (dolist (ev events)
+        (let* ((name  (kqueue:event-udata ev))
+               (c     (find-container name *clbsd-state*))
+               (key   (event->callback-key ev)))
+          (when (and c key)
+            (let ((handler (cdr (assoc key (container-callbacks c)))))
+              (when handler
+                (bt:make-thread
+                  (lambda () (funcall handler c ev)))))))))))
+
+(defun event->callback-key (ev)
+  "Map a kqueue event to the callback keyword used in container structs."
+  (case (kqueue:event-filter ev)
+    (:proc  :on-crash)
+    (:vnode :on-change)
+    (:timer :on-health)))
+#+END_SRC
+
+**** Built-in handlers
+
+CLBSD ships a small set of default handlers the operator can reference by name:
+
+#+BEGIN_SRC lisp
+(defun auto-restart-handler (container event)
+  "Restart the container and signal the reconciler."
+  (declare (ignore event))
+  (log-event :auto-restart :container (container-name container))
+  (setf (container-state container) :stopped)
+  (signal-reconciler))
+
+(defun log-and-alert-handler (container event)
+  "Log the event. Extensible: operator can override to send notifications."
+  (log-event :alert
+    :container (container-name container)
+    :detail (format nil "~A" event)))
+#+END_SRC
+
+*** 2.4 Event Log
+
+Every significant action in the control plane is recorded to an append-only in-memory log (ring buffer) that is also optionally flushed to a file on the routing jail's ZFS dataset.
+
+#+BEGIN_SRC lisp
+(defvar *event-log* (make-array 4096 :fill-pointer 0 :adjustable t))
+
+(defun log-event (type &rest plist)
+  "Append a timestamped event to the log."
+  (let ((entry (list* :time (get-universal-time) :type type plist)))
+    (vector-push-extend entry *event-log*)
+    entry))
+#+END_SRC
+
+Events logged include:
+- ~:reconciler-start~, ~:reconciler-done~, ~:reconciler-error~
+- ~:container-started~, ~:container-stopped~, ~:container-created~, ~:container-destroyed~
+- ~:auto-restart~, ~:alert~
+- ~:kqueue-event~ (raw kqueue event for debugging)
+- ~:nginx-reload~
+
+Layer 3 (Emacs) reads this log to populate the org-mode dashboard.
+
+*** 2.5 Swank Server (SLIME Endpoint)
+
+The control plane starts a Swank server that Emacs (or any SLIME/SLY client) can connect to for live interaction.
+
+#+BEGIN_SRC lisp
+(defun start-control-plane-swank (&key (port 4005))
+  (swank:create-server :port port :dont-close t)
+  (log-event :swank-started :port port))
+#+END_SRC
+
+Through this REPL, the operator has full access to:
+- ~*clbsd-state*~ — read or mutate the desired state.
+- Layer 1 API — ~(start c)~, ~(stop c)~, ~(snapshot c "label")~, etc.
+- ~*event-log*~ — query recent events.
+- Re-load ~clbsd-init.lisp~ to apply a new declarative config.
+- Register ad-hoc kqueue callbacks on running containers.
+
+This is the bridge that Layer 3 (Emacs) connects to.
+
+*** 2.6 Thread Model
+
+The SBCL image runs the following threads (all via ~bordeaux-threads~):
+
+| Thread              | Purpose                                                     | Blocks on               |
+|---------------------+-------------------------------------------------------------+-------------------------|
+| Main                | Loads system, starts other threads, runs Swank REPL         | Swank accept loop       |
+| Reconciler          | Converges actual → desired state (Layer 1 §1.7)             | Condition variable      |
+| kqueue              | Dispatches host events to callbacks (§2.3)                  | ~kevent()~ syscall      |
+| Callback workers    | One-shot threads spawned per kqueue callback invocation     | Callback completion     |
+| Swank workers       | Per-connection threads managed by Swank                     | Client input            |
+
+No shared mutable state is accessed without holding ~*reconciler-lock*~. The kqueue thread and Swank threads only *signal* the reconciler; they never mutate containers directly (except setting ~dirty-p~ through the safe accessors).
+
+** Layers 1–2 Data Flow
+
+#+BEGIN_EXAMPLE
+                           ┌──────────────────────────────────────┐
+                           │          Layer 2: Control Plane       │
+                           │                                       │
+  clbsd-init.lisp ────────►│  load-init ──► (setf *clbsd-state*)  │
+                           │                       │               │
+  SLIME / Emacs ──────────►│  Swank REPL ──────────┤               │
+                           │                       │               │
+  Host events ────────────►│  kqueue thread ──► callbacks ──┐      │
+                           │                                │      │
+                           │       event log ◄── all paths  │      │
+                           └───────────────────────┬────────┘      │
+                                                   │               │
+                                        signal-reconciler          │
+                                                   │               │
+                           ┌───────────────────────▼───────────────┘
+                           │          Layer 1: Container Abstraction
+                           │
+                           │  Reconciler
+                           │    ├─ Jail backend ──► jail(8), ZFS
+                           │    ├─ Docker backend ──► Bhyve VM, docker-cmd, ZFS
+                           │    └─ Nginx generator ──► routing jail
+                           └───────────────────────────────────────
+#+END_EXAMPLE
