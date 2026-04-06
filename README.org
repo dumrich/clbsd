@@ -3,24 +3,23 @@
 ** How it works
 CLBSD is built around several layers of abstractions, all controlled by Common Lisp structures and callback functions. The interface is meant to be easy for Emacs users to use.
 
-*** Layer 0: Tailscale Mesh Network
-CLBSD provides a small layer of abstraction to easily setup a new Tailscale mesh network for all your personal devices. 
+CLBSD assumes host network reachability is pre-configured by the operator (LAN, WireGuard, Tailscale, etc.).
 
 *** Layer 1: Container Abstraction
 The core of CLBSD is the container abstraction. CLBSD provides a nice CL API over FreeBSD Jails and also Linux Docker containers.
 
 **** Data Abstraction
-Every container has an isolated ~ZFS~ dataset that lies on a ~zpool~. This allows for clear separation and sharing of data, with redundnacy and extremely easy migrations. ZFS datasets are logical partitions that can grow dynamically and package together filesystem, data, and snapshot history.
+Every container has an isolated ~ZFS~ dataset that lies on a ~zpool~. This allows for clear separation and sharing of data, with redundancy and extremely easy migrations. ZFS datasets are logical partitions that can grow dynamically and package together filesystem, data, and snapshot history.
 
 **** Logic Abstraction
 The CLBSD container abstraction creates a nice Lisp image that manages both jails and docker containers into a single abstraction. Containers are represented as Lisp objects that are all managed with a unified interface. Every running container can be modified like a lisp image through a remote SLIME connection.
 
-Docker containers are created as minimally as possible, running an Alpine microvm that supports Docker.
+Docker containers run inside a minimal Alpine Linux Bhyve VM, since Docker requires a real Linux kernel (FreeBSD jails cannot provide Linux namespaces or cgroups).
 
 **** Dynamic Ingress & Reverse Proxying
 CLBSD treats reverse proxies (like Nginx) not as static services, but as dynamically generated artifacts of the Lisp control plane. By adding ~domain~ and ~port~ properties to a container's struct, CLBSD automatically manages the routing of subdomains to their relevant jails or Docker microVMs.
 
-Whenever the reconciliation loop detects a change in the active ~clbsd-state~ (such as a new service spinning up or an existing one going offline), a pure Lisp function maps over the active containers to generate a fresh ~nginx.conf~ string. This configuration is automatically written to the ZFS dataset of a dedicated routing jail, and a graceful ~service nginx reload~ is triggered. This creates a fully automated, functional ingress controller that seamlessly binds container endpoints to the Layer 0 Tailscale mesh.
+Whenever the reconciliation loop detects a change in the active ~clbsd-state~ (such as a new service spinning up or an existing one going offline), a pure Lisp function maps over the active containers to generate a fresh ~nginx.conf~ string. This configuration is automatically written to the ZFS dataset of a dedicated routing jail, and a graceful ~service nginx reload~ is triggered. This creates a fully automated, functional ingress controller that exposes container endpoints on the host network interface(s).
 
 *** Layer 2: Common Lisp Control Plane
 The core of CBSD is its container management interface. Containers can be programatically controlled via a lisp library. They are powerful multithreaded abstractions over the host and guest systems.
